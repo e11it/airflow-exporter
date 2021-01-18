@@ -8,20 +8,24 @@ import itertools
 from sqlalchemy import func
 from sqlalchemy import text
 
-from flask import Response
-from flask_admin import BaseView, expose
+import logging
+
+from flask import Response,current_app
+from flask_appbuilder import expose, BaseView as AppBuilderBaseView
 
 from airflow.plugins_manager import AirflowPlugin
-from airflow import settings
+from airflow import settings, DAG
 from airflow.settings import Session
 from airflow.models import TaskInstance, DagModel, DagRun, DagBag
 from airflow.utils.state import State
+from airflow.exceptions import SerializedDagNotFound
 
 # Importing base classes that we need to derive
 from prometheus_client import generate_latest, REGISTRY
 from prometheus_client.core import GaugeMetricFamily, Metric
 from prometheus_client.samples import Sample
 
+log = logging.getLogger(__name__)
 
 @dataclass
 class DagStatusInfo:
@@ -131,19 +135,18 @@ def get_dag_duration_info() -> List[DagDurationInfo]:
             duration = dag_duration
         ))
 
-    return res        
+    return res
 
 
 def get_dag_labels(dag_id: str) -> Dict[str, str]:
     # reuse airflow webserver dagbag
-    if settings.RBAC:
-        from airflow.www_rbac.views import dagbag
-    else:
-        from airflow.www.views import dagbag
+    dagbag: DagBag = current_app.dag_bag
+    #try:
+    dag: DAG = dagbag.get_dag(dag_id)
+    #except SerializedDagNotFound as e:
+    #    return dict()
 
-    dag = dagbag.get_dag(dag_id)
-
-    if dag is None:
+    if not dag:
         return dict()
 
     labels = dag.params.get('labels')
@@ -151,13 +154,13 @@ def get_dag_labels(dag_id: str) -> Dict[str, str]:
     if labels is None:
         return dict()
 
-    return labels
+    return labels["__var"]
 
 
 def _add_gauge_metric(metric, labels, value):
     metric.samples.append(Sample(
         metric.name, labels,
-        value, 
+        value,
         None
     ))
 
@@ -190,9 +193,9 @@ class MetricsCollector(object):
                     'status': dag.status,
                     **labels
                 },
-                dag.cnt, 
+                dag.cnt,
             )
-        
+
         yield dag_status_metric
 
         # DagRun metrics
@@ -208,7 +211,7 @@ class MetricsCollector(object):
                 dag_duration_metric,
                 {
                     'dag_id': dag_duration.dag_id,
-                    **labels
+                    **dict(labels)
                 },
                 dag_duration.duration
             )
@@ -245,33 +248,24 @@ class MetricsCollector(object):
 
 REGISTRY.register(MetricsCollector())
 
-if settings.RBAC:
-    from flask_appbuilder import BaseView as FABBaseView, expose as FABexpose
-    class RBACMetrics(FABBaseView):
-        route_base = "/admin/metrics/"
-        @FABexpose('/')
-        def list(self):
-            return Response(generate_latest(), mimetype='text')
+
+
+class Metrics(AppBuilderBaseView):
+    route_base = "/admin/metrics/"
+    @expose('/')
+    def list(self):
+        return Response(generate_latest(), mimetype='text')
 
 
     # Metrics View for Flask app builder used in airflow with rbac enabled
-    RBACmetricsView = {
-        "view": RBACMetrics(),
-        "name": "metrics",
-        "category": "Admin"
-    }
+v_metrics_view = {
+    "view": Metrics(),
+    "name": "metrics",
+    "category": "Admin"
+}
 
-    www_views = []
-    www_rbac_views = [RBACmetricsView]
-
-else:
-    class Metrics(BaseView):
-        @expose('/')
-        def index(self):
-            return Response(generate_latest(), mimetype='text/plain')
-
-    www_views = [Metrics(category="Admin", name="Metrics")]
-    www_rbac_views = []
+www_views = []
+www_rbac_views = [v_metrics_view]
 
 
 class AirflowPrometheusPlugins(AirflowPlugin):
